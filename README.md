@@ -18,7 +18,18 @@ A modern, high-performance Formula 1 prediction engine and accuracy analysis das
 - **Data Engine**: `FastF1` for precise telemetry and session data.
 - **ML Models**: Weighted scoring logic based on performance deltas and consistency metrics.
 
+## ⚡ Quick Start (One-Command)
+
+To launch both the Backend and Frontend with a single command:
+
+```bash
+python start_f1.py
+```
+This will open two new console windows for the servers and automatically launch your browser to `http://localhost:3000`.
+
 ## 🛠️ Setup & Installation
+
+Before running for the first time, install the dependencies for both environments:
 
 ### 1. Backend (Python)
 Ensure you have Python 3.9+ installed.
@@ -26,7 +37,6 @@ Ensure you have Python 3.9+ installed.
 ```bash
 cd backend
 pip install fastapi uvicorn fastf1 pandas numpy xgboost joblib tenacity
-python start_f1.py
 ```
 *Note: The first run will create a `cache/` directory. Initial data downloads for historical years may take several minutes.*
 
@@ -36,7 +46,6 @@ Ensure you have Node.js 18+ installed.
 ```bash
 cd frontend
 npm install
-npm run dev
 ```
 The app will be available at `http://localhost:3000`.
 
