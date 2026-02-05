@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+fastf1
+pandas
+numpy
+xgboost
+scikit-learn
+joblib
+tenacity
+python-multipart
+pydantic
+pydantic-settings
