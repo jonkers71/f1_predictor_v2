@@ -153,27 +153,108 @@ class F1DataEngine:
             logger.error(f"Error getting consistency: {e}")
             return {}
 
+    def get_rolling_team_rating(self, team_name: str, year: int, current_round: int, window: int = 3) -> float:
+        """
+        Calculates a dynamic team rating based on the average qualifying pace deficit
+        over the last `window` races.
+        0.0% deficit = 1.0 rating
+        1.0% deficit = 0.7 rating
+        2.5% deficit = 0.2 rating
+        """
+        try:
+            deficits = []
+            # Look back through previous rounds
+            for r in range(current_round - 1, max(0, current_round - window - 1), -1):
+                try:
+                    # Try to get qualifying session
+                    # If current_round is 1, it will look at last year's late rounds
+                    target_year = year
+                    target_round = r
+                    if r <= 0:
+                        target_year = year - 1
+                        # Find max round of previous year
+                        prev_schedule = self.get_event_schedule(target_year)
+                        target_round = int(prev_schedule['RoundNumber'].max()) + r
+                    
+                    session = self.get_session(target_year, target_round, 'Q')
+                    laps = session.laps.pick_quicklaps()
+                    if laps.empty:
+                        continue
+                    
+                    pole_time = laps['LapTime'].min().total_seconds()
+                    team_laps = laps[laps['Team'] == team_name]
+                    if team_laps.empty:
+                        # Fallback: maybe teammate abbreviation check if team name differs
+                        continue
+                    
+                    team_best = team_laps['LapTime'].min().total_seconds()
+                    
+                    # Percentage deficit
+                    pct_deficit = ((team_best - pole_time) / pole_time) * 100.0
+                    deficits.append(pct_deficit)
+                except:
+                    continue
+            
+            if not deficits:
+                # Fallback to static if no recent data
+                return self.get_team_rating(team_name)
+            
+            avg_deficit = np.mean(deficits)
+            
+            # Mapping: 0.0 -> 1.0, 1.0 -> 0.7, 2.5 -> 0.2
+            # Linear interpolation or smooth curve
+            # formula: rating = max(0, 1.0 - (avg_deficit / 3.0)) 
+            # But let's use the user's specific points:
+            if avg_deficit <= 0.05: return 1.0
+            if avg_deficit <= 1.0:
+                # Interpolate 1.0 -> 0.7
+                return 1.0 - (avg_deficit * 0.3)
+            # Interpolate 1.0(0.7) -> 2.5(0.2)
+            rating = 0.7 - ((avg_deficit - 1.0) * (0.5 / 1.5))
+            return float(max(0.05, rating))
+            
+        except Exception as e:
+            logger.error(f"Error calculating rolling rating for {team_name}: {e}")
+            return self.get_team_rating(team_name)
+
+    def get_constructor_maturity(self, team_name: str) -> float:
+        """
+        Returns a maturity index (0-1).
+        Brand new teams start at 0.15 and grow as they complete races.
+        """
+        # In a real scenario, we'd query historical records.
+        # For 2026 simulation:
+        new_teams = {
+            "Cadillac": 0,
+            "Audi": 0,
+            "Andretti": 0
+        }
+        
+        # Hardcoded for the 2026 scenario start
+        if team_name in new_teams:
+            return 0.15
+        return 1.0
+
     def get_team_rating(self, team_name: str) -> float:
         """
-        Returns a strength rating (0-1) for a team based on general constructor performance.
-        1.0 = Dominant, 0.1 = Backmarker.
+        Baseline ratings for the start of 2026.
         """
         ratings = {
-            "McLaren": 0.98,
-            "Ferrari": 0.96,
-            "Mercedes": 0.90,
-            "Red Bull Racing": 0.78,
-            "Aston Martin": 0.70,
-            "RB": 0.60,
-            "Racing Bulls": 0.60,
-            "Haas F1 Team": 0.55,
-            "Williams": 0.45,
-            "Alpine": 0.35,
+            "Mercedes": 0.98,
+            "Ferrari": 0.95,
+            "Haas F1 Team": 0.70,
+            "Red Bull Racing": 0.60,
+            "McLaren": 0.55,
+            "Aston Martin": 0.45,
+            "RB": 0.40,
+            "Racing Bulls": 0.40,
+            "Alpine": 0.30,
+            "Sauber": 0.25,
             "Kick Sauber": 0.25,
-            "Sauber": 0.25
+            "Audi": 0.20,
+            "Cadillac": 0.15
         }
-        # Fuzzy match if needed, but dict lookups are safer
-        return ratings.get(team_name, 0.5)
+        return ratings.get(team_name, 0.10)
 
     def format_lap_time(self, seconds: float) -> str:
         """Formats seconds into mm:ss.xxx string."""

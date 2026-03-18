@@ -74,9 +74,7 @@ class F1PredictorModel:
         lap_counts = session_data.get("lap_counts", {})
         consistency = session_data.get("consistency", {})
         long_stint = session_data.get("long_stint_pace", {})
-        
-        # Rookies 2025/2026 for variance penalty
-        rookies = ["ANT", "BEA", "HAD", "DOO", "BOR"]
+        maturities = session_data.get("constructor_maturity", {})
         
         # Calculate field min for deltas
         times = [t for t in ideal_laps.values() if t is not None]
@@ -94,8 +92,9 @@ class F1PredictorModel:
             stint_time = long_stint.get(abbr)
             
             i_delta = (i_time - min_ideal_time) if i_time and min_ideal_time else 0.8
-            stint_delta = (stint_time - min_stint_time) if stint_time and min_stint_time else i_delta * 1.2  # Estimate from quali pace
+            stint_delta = (stint_time - min_stint_time) if stint_time and min_stint_time else i_delta * 1.2
             t_rating = team_ratings.get(team, 0.5)
+            c_maturity = maturities.get(team, 1.0)
             
             # Reliability metrics (0-1, higher is better)
             laps = lap_counts.get(abbr, 0)
@@ -105,12 +104,16 @@ class F1PredictorModel:
             raw_cons = consistency.get(abbr, 1.0)
             cons_score = max(0, 1.0 - (raw_cons / 1.5))
             
+            # Reliability is heavily impacted by constructor maturity for new teams
+            reliability_score = ((volume_score * 0.4) + (cons_score * 0.6)) * c_maturity
+            
             feat = {
                 "ideal_lap_delta": float(i_delta),
                 "long_stint_delta": float(stint_delta),
                 "team_strength": float(t_rating),
-                "reliability": float((volume_score * 0.4) + (cons_score * 0.6)),
-                "is_rookie": 1 if abbr in rookies else 0,
+                "reliability": float(reliability_score),
+                "constructor_maturity": float(c_maturity),
+                "is_rookie": 1 if driver.get("is_rookie") else 0,
                 "track_temp": float(session_data.get("weather", {}).get("track_temp", 30)),
                 "is_sprint": 1 if "Sprint" in session_data.get("session_name", "") else 0,
                 "has_long_stint": 1 if stint_time is not None else 0
@@ -126,26 +129,24 @@ class F1PredictorModel:
         """
         # Session-specific weighting
         if session_type == "R":
-            # RACE PREDICTION FORMULA:
-            # Long stint pace is king for race predictions
+            # RACE PREDICTION FORMULA
             has_stint_data = X["has_long_stint"].sum() > 0
             if has_stint_data:
-                # With long stint data available
-                w_stint, w_pace, w_team, w_reliability, w_rookie = 35, 20, 25, 15, 5
+                w_stint, w_pace, w_team, w_reliability, w_rookie, w_maturity = 30, 15, 20, 15, 5, 15
             else:
-                # Fallback: no stint data, use single lap pace more heavily
-                w_stint, w_pace, w_team, w_reliability, w_rookie = 0, 45, 30, 20, 5
+                w_stint, w_pace, w_team, w_reliability, w_rookie, w_maturity = 0, 40, 25, 15, 5, 15
         else:
-            # QUALIFYING PACE FORMULA:
-            w_stint, w_pace, w_team, w_reliability, w_rookie = 0, 65, 20, 10, 5
+            # QUALIFYING PACE FORMULA
+            w_stint, w_pace, w_team, w_reliability, w_rookie, w_maturity = 0, 60, 20, 10, 5, 5
         
         pace_scores = X["ideal_lap_delta"] * w_pace
         stint_scores = X["long_stint_delta"] * w_stint if w_stint > 0 else pace_scores * 0
         latent_scores = (1.0 - X["team_strength"]) * w_team
         reliability_penalties = (1.0 - X["reliability"]) * w_reliability
         rookie_penalties = X["is_rookie"] * w_rookie
+        maturity_penalties = (1.0 - X["constructor_maturity"]) * w_maturity
         
-        final_scores = pace_scores + stint_scores + latent_scores + reliability_penalties + rookie_penalties
+        final_scores = pace_scores + stint_scores + latent_scores + reliability_penalties + rookie_penalties + maturity_penalties
         
         # Build breakdown for transparency
         breakdown = []
@@ -155,12 +156,14 @@ class F1PredictorModel:
                 "team_score": float(latent_scores.iloc[i]),
                 "reliability_score": float(reliability_penalties.iloc[i]),
                 "rookie_score": float(rookie_penalties.iloc[i]),
+                "maturity_score": float(maturity_penalties.iloc[i]),
                 "final_score": float(final_scores.iloc[i]),
                 "weights": {
                     "pace": w_pace,
                     "team": w_team,
                     "reliability": w_reliability,
-                    "rookie": w_rookie
+                    "rookie": w_rookie,
+                    "maturity": w_maturity
                 }
             }
             if w_stint > 0:

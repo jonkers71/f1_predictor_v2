@@ -8,6 +8,7 @@ interface Weights {
   reliability: number;
   rookie: number;
   long_stint?: number;
+  maturity: number;
 }
 
 interface Breakdown {
@@ -15,6 +16,7 @@ interface Breakdown {
   team_score: number;
   reliability_score: number;
   rookie_score: number;
+  maturity_score: number;
   stint_score?: number;
   final_score: number;
   weights: Weights;
@@ -26,7 +28,7 @@ interface WeightingBreakdownProps {
 }
 
 const WeightingBreakdown: React.FC<WeightingBreakdownProps> = ({ breakdown, driverName }) => {
-  const { pace_score, team_score, reliability_score, rookie_score, stint_score, weights } = breakdown;
+  const { pace_score, team_score, reliability_score, rookie_score, maturity_score, stint_score, weights } = breakdown;
   
   const items = [
     { label: 'Raw Pace', value: pace_score, weight: weights.pace, color: '#66fcf1' },
@@ -41,6 +43,7 @@ const WeightingBreakdown: React.FC<WeightingBreakdownProps> = ({ breakdown, driv
     { label: 'Team Strength', value: team_score, weight: weights.team, color: '#45a29e' },
     { label: 'Reliability', value: reliability_score, weight: weights.reliability, color: '#f7f1e3' },
     { label: 'Rookie Var', value: rookie_score, weight: weights.rookie, color: '#ff5252' },
+    { label: 'Team Maturity', value: maturity_score, weight: weights.maturity, color: '#ff793f' },
   );
 
   return (
