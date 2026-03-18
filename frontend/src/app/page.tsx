@@ -341,8 +341,8 @@ export default function Dashboard() {
               <div className="flex justify-between text-sm">
                 <span>Last Trained</span>
                 <span className="text-[#66fcf1] font-mono text-xs">
-                  {modelStatus?.last_trained !== 'never' 
-                    ? new Date(modelStatus!.last_trained).toLocaleString() 
+                  {modelStatus && modelStatus.last_trained !== 'never' 
+                    ? new Date(modelStatus.last_trained).toLocaleString() 
                     : 'System Default'}
                 </span>
               </div>
