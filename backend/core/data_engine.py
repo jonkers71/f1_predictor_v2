@@ -159,18 +159,18 @@ class F1DataEngine:
         1.0 = Dominant, 0.1 = Backmarker.
         """
         ratings = {
-            "Red Bull Racing": 0.95,
             "McLaren": 0.98,
-            "Ferrari": 0.92,
-            "Mercedes": 0.85,
-            "Aston Martin": 0.65,
-            "RB": 0.55,
-            "Racing Bulls": 0.55,
-            "Haas F1 Team": 0.45,
-            "Williams": 0.40,
+            "Ferrari": 0.96,
+            "Mercedes": 0.90,
+            "Red Bull Racing": 0.78,
+            "Aston Martin": 0.70,
+            "RB": 0.60,
+            "Racing Bulls": 0.60,
+            "Haas F1 Team": 0.55,
+            "Williams": 0.45,
             "Alpine": 0.35,
-            "Kick Sauber": 0.20,
-            "Sauber": 0.20
+            "Kick Sauber": 0.25,
+            "Sauber": 0.25
         }
         # Fuzzy match if needed, but dict lookups are safer
         return ratings.get(team_name, 0.5)
@@ -183,6 +183,175 @@ class F1DataEngine:
         rem_seconds = seconds % 60
         return f"{minutes}:{rem_seconds:06.3f}"
 
+    def get_current_grid(self, year: int) -> List[Dict[str, str]]:
+        """
+        Dynamically retrieves the current driver lineup for a given year.
+        Walks backwards through completed rounds to find the most recent session with results.
+        """
+        try:
+            schedule = self.get_event_schedule(year)
+            if schedule.empty:
+                return []
+            
+            events = schedule[schedule['RoundNumber'] > 0]
+            now = datetime.now()
+            
+            # Walk backwards from the most recent past event
+            for _, event in events.iloc[::-1].iterrows():
+                try:
+                    event_date = event['EventDate']
+                    if hasattr(event_date, 'timestamp') and event_date > now:
+                        continue
+                    
+                    # Try qualifying first, then race
+                    for sid in ['Q', 'R', 'FP1']:
+                        try:
+                            session = self.get_session(year, int(event['RoundNumber']), sid)
+                            results = self.get_driver_results(session)
+                            if not results.empty:
+                                grid = []
+                                for _, row in results.iterrows():
+                                    grid.append({
+                                        "Abbreviation": row['Abbreviation'],
+                                        "TeamName": row['TeamName'],
+                                        "FullName": row['FullName']
+                                    })
+                                logger.info(f"Got {year} grid from R{int(event['RoundNumber'])} {sid}: {len(grid)} drivers")
+                                return grid
+                        except:
+                            continue
+                except:
+                    continue
+            
+            # If no completed events yet, try loading the first event's entry list
+            try:
+                first_round = int(events.iloc[0]['RoundNumber'])
+                session = self.get_session(year, first_round, 'FP1')
+                results = self.get_driver_results(session)
+                if not results.empty:
+                    return [{"Abbreviation": r['Abbreviation'], "TeamName": r['TeamName'], "FullName": r['FullName']} 
+                            for _, r in results.iterrows()]
+            except:
+                pass
+            
+            return []
+        except Exception as e:
+            logger.error(f"Error getting current grid for {year}: {e}")
+            return []
+
+    def get_circuit_history(self, circuit_name: str, session_type: str = "Q", 
+                           years: List[int] = None) -> Dict[str, Any]:
+        """
+        Gets historical performance data at a specific circuit across multiple years.
+        Returns average deltas per driver (normalized to pole) and metadata about what was found.
+        """
+        if years is None:
+            years = [2025, 2024, 2023]
+        
+        all_deltas = {}  # driver_abbr -> list of deltas across years
+        sessions_found = []
+        
+        for yr in years:
+            try:
+                # FastF1 accepts circuit name strings (e.g. "Japan", "Bahrain")
+                session = self.get_session(yr, circuit_name, session_type)
+                ideal_laps = self.get_ideal_laps(session)
+                
+                if ideal_laps.empty:
+                    continue
+                
+                # Normalize to the fastest (pole) time
+                min_time = ideal_laps['IdealLapSeconds'].min()
+                
+                for _, row in ideal_laps.iterrows():
+                    drv = row['Driver']
+                    delta = row['IdealLapSeconds'] - min_time
+                    if drv not in all_deltas:
+                        all_deltas[drv] = []
+                    all_deltas[drv].append(delta)
+                
+                event_name = session.event['EventName']
+                sessions_found.append(f"{yr} {event_name} {session_type}")
+                logger.info(f"Circuit history: loaded {yr} {circuit_name} {session_type}")
+            except Exception as e:
+                logger.warning(f"Circuit history: {yr} {circuit_name} {session_type} not available: {e}")
+                continue
+        
+        # Average deltas across years
+        avg_deltas = {}
+        for drv, deltas in all_deltas.items():
+            avg_deltas[drv] = float(np.mean(deltas))
+        
+        return {
+            "deltas": avg_deltas,
+            "sessions_found": sessions_found,
+            "circuit": circuit_name,
+            "years_searched": years,
+            "drivers_found": len(avg_deltas)
+        }
+
+    def get_long_stint_pace(self, session) -> Dict[str, float]:
+        """
+        Extracts long stint average pace from a practice session.
+        A 'long stint' is 5+ consecutive laps on the same compound.
+        Returns {driver_abbr: avg_lap_time_seconds} for race pace estimation.
+        """
+        try:
+            laps = session.laps
+            if laps.empty:
+                return {}
+            
+            long_stint_paces = {}
+            
+            for driver in laps['Driver'].unique():
+                driver_laps = laps.pick_drivers(driver).sort_values('LapNumber')
+                
+                if driver_laps.empty or len(driver_laps) < 5:
+                    continue
+                
+                # Find consecutive laps on the same compound
+                best_stint_pace = None
+                current_stint = []
+                current_compound = None
+                
+                for _, lap in driver_laps.iterrows():
+                    compound = lap.get('Compound', 'UNKNOWN')
+                    lap_time = lap['LapTime']
+                    
+                    if pd.isna(lap_time):
+                        current_stint = []
+                        current_compound = None
+                        continue
+                    
+                    lap_seconds = lap_time.total_seconds()
+                    
+                    # Skip obvious outliers (pit laps, safety car, etc.)
+                    if lap_seconds > 200 or lap_seconds < 60:
+                        current_stint = []
+                        current_compound = None
+                        continue
+                    
+                    if compound == current_compound:
+                        current_stint.append(lap_seconds)
+                    else:
+                        current_compound = compound
+                        current_stint = [lap_seconds]
+                    
+                    # If we have a stint of 5+ laps, calculate average
+                    if len(current_stint) >= 5:
+                        # Drop the first lap (outlap/adjustment) and calculate
+                        stint_pace = np.mean(current_stint[1:])
+                        if best_stint_pace is None or stint_pace < best_stint_pace:
+                            best_stint_pace = stint_pace
+                
+                if best_stint_pace is not None:
+                    long_stint_paces[driver] = float(best_stint_pace)
+            
+            return long_stint_paces
+        except Exception as e:
+            logger.error(f"Error extracting long stint pace: {e}")
+            return {}
+
     def get_next_event(self) -> Dict[str, Any]:
         """Identifies the next upcoming event from the 2026 schedule."""
         try:
@@ -194,12 +363,13 @@ class F1DataEngine:
                 "round": int(upcoming['RoundNumber']),
                 "name": upcoming['EventName'],
                 "location": upcoming['Location'],
+                "country": upcoming.get('Country', upcoming['EventName']),
                 "date": upcoming['EventDate'].strftime('%Y-%m-%d'),
                 "year": 2026
             }
         except Exception as e:
             logger.error(f"Error getting next event: {e}")
-            return {"round": 1, "name": "Bahrain Grand Prix", "year": 2026}
+            return {"round": 1, "name": "Bahrain Grand Prix", "year": 2026, "country": "Bahrain"}
 
 if __name__ == "__main__":
     # Test script

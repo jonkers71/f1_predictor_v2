@@ -1,7 +1,24 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import Link from "next/link";
+import WeightingBreakdown from "@/components/WeightingBreakdown";
+
+interface Weights {
+    pace: number;
+    team: number;
+    reliability: number;
+    rookie: number;
+}
+
+interface Breakdown {
+    pace_score: number;
+    team_score: number;
+    reliability_score: number;
+    rookie_score: number;
+    final_score: number;
+    weights: Weights;
+}
 
 interface ComparisonRow {
     driver: string;
@@ -11,6 +28,7 @@ interface ComparisonRow {
     actual_time: string;
     predicted_time: string;
     delta_error: number;
+    breakdown: Breakdown;
 }
 
 interface SessionInfo {
@@ -153,6 +171,8 @@ export default function BacktestPage() {
         }
     };
 
+    const [selectedDriver, setSelectedDriver] = useState<string | null>(null);
+
     return (
         <main className="min-h-screen bg-[#0b0c10] text-[#c5c6c7] p-8">
             <header className="flex flex-col md:flex-row justify-between items-center mb-12 border-b border-[#45a29e] pb-6 gap-6">
@@ -272,7 +292,7 @@ export default function BacktestPage() {
                 </div>
             )}
 
-            <div className="bg-[#1f2833] rounded-2xl overflow-hidden border border-[#45a29e]/20 shadow-2xl">
+            <div className="bg-[#1f2833] rounded-2xl border border-[#45a29e]/20 shadow-2xl overflow-hidden">
                 <table className="w-full text-left border-collapse">
                     <thead>
                         <tr className="bg-[#0b0c10] text-[#45a29e] text-[10px] uppercase tracking-widest">
@@ -286,24 +306,38 @@ export default function BacktestPage() {
                     </thead>
                     <tbody className="divide-y divide-[#45a29e]/10">
                         {results?.map((r, i) => (
-                            <tr key={r.driver} className="hover:bg-[#66fcf1]/5 transition-colors group">
-                                <td className="p-4">
-                                    <div className="font-bold text-white group-hover:text-[#66fcf1]">{r.driver.toUpperCase()}</div>
-                                    <div className="text-[10px] text-[#45a29e] uppercase font-mono">{r.team}</div>
-                                </td>
-                                <td className="p-4 font-mono text-xl">{r.actual_rank}</td>
-                                <td className={`p-4 font-mono text-xl ${r.predicted_rank === r.actual_rank ? 'text-[#66fcf1]' : 'text-white'}`}>
-                                    {r.predicted_rank}
-                                </td>
-                                <td className="p-4 font-mono text-sm">{r.actual_time}</td>
-                                <td className="p-4 font-mono text-sm text-[#45a29e] italic">{r.predicted_time}</td>
-                                <td className="p-4 text-right">
-                                    <span className={`font-mono text-sm px-2 py-1 rounded bg-[#0b0c10] border ${r.delta_error < 0.1 ? 'border-[#66fcf1] text-[#66fcf1]' : 'border-red-500/30 text-red-400'
-                                        }`}>
-                                        {r.delta_error.toFixed(3)}s
-                                    </span>
-                                </td>
-                            </tr>
+                            <React.Fragment key={r.driver}>
+                                <tr 
+                                    onClick={() => setSelectedDriver(selectedDriver === r.driver ? null : r.driver)}
+                                    className="hover:bg-[#66fcf1]/5 transition-colors group cursor-pointer"
+                                >
+                                    <td className="p-4">
+                                        <div className="font-bold text-white group-hover:text-[#66fcf1]">{r.driver.toUpperCase()}</div>
+                                        <div className="text-[10px] text-[#45a29e] uppercase font-mono">{r.team}</div>
+                                    </td>
+                                    <td className="p-4 font-mono text-xl">{r.actual_rank}</td>
+                                    <td className={`p-4 font-mono text-xl ${r.predicted_rank === r.actual_rank ? 'text-[#66fcf1]' : 'text-white'}`}>
+                                        {r.predicted_rank}
+                                    </td>
+                                    <td className="p-4 font-mono text-sm">{r.actual_time}</td>
+                                    <td className="p-4 font-mono text-sm text-[#45a29e] italic">{r.predicted_time}</td>
+                                    <td className="p-4 text-right">
+                                        <span className={`font-mono text-sm px-2 py-1 rounded bg-[#0b0c10] border ${r.delta_error < 0.1 ? 'border-[#66fcf1] text-[#66fcf1]' : 'border-red-500/30 text-red-400'
+                                            }`}>
+                                            {r.delta_error.toFixed(3)}s
+                                        </span>
+                                    </td>
+                                </tr>
+                                {selectedDriver === r.driver && (
+                                    <tr>
+                                        <td colSpan={6} className="p-0 bg-[#0b0c10]/50 border-b border-[#45a29e]/10">
+                                            <div className="p-4 max-w-2xl mx-auto">
+                                                <WeightingBreakdown breakdown={r.breakdown} driverName={r.driver} />
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                            </React.Fragment>
                         ))}
                     </tbody>
                 </table>
