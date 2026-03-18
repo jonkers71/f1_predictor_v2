@@ -22,10 +22,14 @@ async def test_prediction():
         print("\nTop 5 Predictions:")
         for pred in result['predictions'][:5]:
             print(f"{pred['rank']}. {pred['driver']} ({pred['team']}) - {pred['time']}")
+            bd = pred['breakdown']
+            print(f"   [Base: {bd['base_score']:.2f} | Slope: {bd['slope_score']:.2f} | Sunday: {bd['sunday_conversion']:.2f}]")
             
         print("\nBottom 3 Predictions:")
         for pred in result['predictions'][-3:]:
             print(f"{pred['rank']}. {pred['driver']} ({pred['team']}) - {pred['time']}")
+            bd = pred['breakdown']
+            print(f"   [Base: {bd['base_score']:.2f} | Slope: {bd['slope_score']:.2f} | Sunday: {bd['sunday_conversion']:.2f}]")
             
         print("\nData Source Notes:")
         for note in result['data_sources']['notes']:

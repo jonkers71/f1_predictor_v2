@@ -20,8 +20,9 @@ class F1PredictorModel:
         self.ranker_path = os.path.join(MODELS_DIR, "ranker.json")
         self.regressor_path = os.path.join(MODELS_DIR, "regressor.json")
         self.feature_names = [
-            "avg_practice_delta", "practice_consistency", "track_temp", 
-            "air_temp", "is_sprint", "tyre_life", "team_momentum"
+            "ideal_lap_delta", "base_pace_delta", "stint_slope", "stint_variance",
+            "team_strength", "reliability", "constructor_maturity", "is_rookie",
+            "sunday_conversion_factor", "track_temp", "is_sprint", "has_long_stint"
         ]
 
     def build_models(self):
@@ -73,50 +74,64 @@ class F1PredictorModel:
         team_ratings = session_data.get("team_ratings", {})
         lap_counts = session_data.get("lap_counts", {})
         consistency = session_data.get("consistency", {})
-        long_stint = session_data.get("long_stint_pace", {})
+        long_stint = session_data.get("long_stint_pace", {}) # Now {driver: {slope, intercept, variance}}
         maturities = session_data.get("constructor_maturity", {})
+        sunday_conv = session_data.get("sunday_conversion", {})
         
         # Calculate field min for deltas
         times = [t for t in ideal_laps.values() if t is not None]
         min_ideal_time = min(times) if times else 0
         
-        # Calculate field min for long stint
-        stint_times = [t for t in long_stint.values() if t is not None]
-        min_stint_time = min(stint_times) if stint_times else 0
+        # Calculate field min for base pace (intercept)
+        intercepts = [v["intercept"] for v in long_stint.values() if v and "intercept" in v]
+        min_intercept = min(intercepts) if intercepts else 0
         
         features_list = []
         for driver in drivers:
             abbr = driver.get("Abbreviation")
             team = driver.get("TeamName")
             i_time = ideal_laps.get(abbr)
-            stint_time = long_stint.get(abbr)
+            stint_profile = long_stint.get(abbr) # {slope, intercept, variance}
             
-            i_delta = (i_time - min_ideal_time) if i_time and min_ideal_time else 0.8
-            stint_delta = (stint_time - min_stint_time) if stint_time and min_stint_time else i_delta * 1.2
+            i_delta = (i_time - min_ideal_time) if i_time and min_ideal_time else 1.0
+            
+            # Extract high-fidelity stint metrics
+            if stint_profile:
+                base_pace_delta = (stint_profile["intercept"] - min_intercept) if min_intercept else i_delta
+                stint_slope = stint_profile["slope"]
+                stint_variance = stint_profile["variance"]
+                has_stint = 1
+            else:
+                # Fallback: assume average wear (0.05s/lap) and high variance if no data
+                base_pace_delta = i_delta * 1.1
+                stint_slope = 0.05
+                stint_variance = 0.5
+                has_stint = 0
+                
             t_rating = team_ratings.get(team, 0.5)
             c_maturity = maturities.get(team, 1.0)
+            conversion = sunday_conv.get(team, 0.0)
             
             # Reliability metrics (0-1, higher is better)
             laps = lap_counts.get(abbr, 0)
             volume_score = min(laps / 15.0, 1.0)
+            cons_score = max(0, 1.0 - (consistency.get(abbr, 1.0) / 1.5))
             
-            # Consistency penalty (low stdev is good)
-            raw_cons = consistency.get(abbr, 1.0)
-            cons_score = max(0, 1.0 - (raw_cons / 1.5))
-            
-            # Reliability is heavily impacted by constructor maturity for new teams
             reliability_score = ((volume_score * 0.4) + (cons_score * 0.6)) * c_maturity
             
             feat = {
                 "ideal_lap_delta": float(i_delta),
-                "long_stint_delta": float(stint_delta),
+                "base_pace_delta": float(base_pace_delta),
+                "stint_slope": float(stint_slope),
+                "stint_variance": float(stint_variance),
                 "team_strength": float(t_rating),
                 "reliability": float(reliability_score),
                 "constructor_maturity": float(c_maturity),
                 "is_rookie": 1 if driver.get("is_rookie") else 0,
+                "sunday_conversion_factor": float(conversion),
                 "track_temp": float(session_data.get("weather", {}).get("track_temp", 30)),
                 "is_sprint": 1 if "Sprint" in session_data.get("session_name", "") else 0,
-                "has_long_stint": 1 if stint_time is not None else 0
+                "has_long_stint": has_stint
             }
             features_list.append(feat)
         
@@ -130,57 +145,51 @@ class F1PredictorModel:
         # Session-specific weighting
         if session_type == "R":
             # RACE PREDICTION FORMULA
-            has_stint_data = X["has_long_stint"].sum() > 0
-            if has_stint_data:
-                w_stint, w_pace, w_team, w_reliability, w_rookie, w_maturity = 30, 15, 20, 15, 5, 15
-            else:
-                w_stint, w_pace, w_team, w_reliability, w_rookie, w_maturity = 0, 40, 25, 15, 5, 15
+            # Increased weight on slope, variance, and sunday conversion
+            w_base, w_slope, w_variance, w_conv = 20, 35, 15, 10
+            w_team, w_reliability, w_maturity = 10, 5, 5
         else:
             # QUALIFYING PACE FORMULA
-            w_stint, w_pace, w_team, w_reliability, w_rookie, w_maturity = 0, 60, 20, 10, 5, 5
+            # 100% focused on i_delta and base speed
+            w_base, w_slope, w_variance, w_conv = 70, 0, 0, 0
+            w_team, w_reliability, w_maturity = 20, 5, 5
         
-        pace_scores = X["ideal_lap_delta"] * w_pace
-        stint_scores = X["long_stint_delta"] * w_stint if w_stint > 0 else pace_scores * 0
+        base_scores = X["base_pace_delta"] * w_base
+        slope_scores = X["stint_slope"] * 50.0 * w_slope # Scaling slope (e.g. 0.05 -> 2.5s impact)
+        var_scores = X["stint_variance"] * 10.0 * w_variance
+        conv_bonus = X["sunday_conversion_factor"] * 50.0 * w_conv # Positive conversion reduces score
+        
         latent_scores = (1.0 - X["team_strength"]) * w_team
         reliability_penalties = (1.0 - X["reliability"]) * w_reliability
-        rookie_penalties = X["is_rookie"] * w_rookie
         maturity_penalties = (1.0 - X["constructor_maturity"]) * w_maturity
         
-        final_scores = pace_scores + stint_scores + latent_scores + reliability_penalties + rookie_penalties + maturity_penalties
+        final_scores = base_scores + slope_scores + var_scores - conv_bonus + latent_scores + reliability_penalties + maturity_penalties
         
         # Build breakdown for transparency
         breakdown = []
         for i in range(len(X)):
             bd = {
-                "pace_score": float(pace_scores.iloc[i]),
+                "base_score": float(base_scores.iloc[i]),
+                "slope_score": float(slope_scores.iloc[i]),
+                "consistency_score": float(var_scores.iloc[i]),
+                "sunday_conversion": float(conv_bonus.iloc[i]),
                 "team_score": float(latent_scores.iloc[i]),
-                "reliability_score": float(reliability_penalties.iloc[i]),
-                "rookie_score": float(rookie_penalties.iloc[i]),
-                "maturity_score": float(maturity_penalties.iloc[i]),
                 "final_score": float(final_scores.iloc[i]),
                 "weights": {
-                    "pace": w_pace,
-                    "team": w_team,
-                    "reliability": w_reliability,
-                    "rookie": w_rookie,
-                    "maturity": w_maturity
+                    "base": w_base,
+                    "slope": w_slope,
+                    "consistency": w_variance,
+                    "conversion": w_conv,
+                    "team": w_team
                 }
             }
-            if w_stint > 0:
-                bd["stint_score"] = float(stint_scores.iloc[i])
-                bd["weights"]["long_stint"] = w_stint
             breakdown.append(bd)
         
         # Predicted Rankings (lower score is better)
         ranks = final_scores.values
         
-        # Predicted Deltas
-        if session_type == "R" and w_stint > 0:
-            base_delta = X["long_stint_delta"].values
-        else:
-            base_delta = X["ideal_lap_delta"].values
-        correction = (1.0 - X["reliability"].values) * 0.2
-        predicted_deltas = base_delta + correction
+        # Predicted Deltas (for time estimation)
+        predicted_deltas = X["base_pace_delta"].values + (X["stint_slope"].values * 20.0 if session_type == "R" else 0)
         
         return ranks, predicted_deltas, breakdown
 

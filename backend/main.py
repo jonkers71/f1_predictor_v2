@@ -99,6 +99,27 @@ async def sync_status():
     """Returns the last sync timestamp."""
     return {"last_synced": _last_synced}
 
+@app.get("/model/status")
+async def model_status():
+    """Returns the status and last training time of the XGBoost models."""
+    from core.models import MODELS_DIR
+    ranker_path = os.path.join(MODELS_DIR, "ranker.json")
+    
+    status = "offline"
+    last_trained = "never"
+    
+    if os.path.exists(ranker_path):
+        status = "active"
+        mtime = os.path.getmtime(ranker_path)
+        last_trained = datetime.fromtimestamp(mtime).isoformat()
+        
+    return {
+        "status": status,
+        "last_trained": last_trained,
+        "feature_version": "2.1 (High-Fidelity Stints)",
+        "engine": "XGBoost 2.0.3"
+    }
+
 
 @app.get("/session/{year}/{gp}/{identifier}")
 async def get_session_info(year: int, gp: str, identifier: str):
@@ -194,12 +215,18 @@ async def run_backtest(year: int, gp: str, session_type: str):
         from core.models import F1PredictorModel
         model = F1PredictorModel()
         
+        # Calculate maturies and conversions for backtest
+        maturities_dict = {t: 1.0 for t in results['TeamName'].unique()} # Backtest teams are established
+        sunday_conv_dict = {t: engine.get_sunday_conversion_factor(t, count=3) for t in results['TeamName'].unique()}
+
         session_context = {
             "results": actual_results.to_dict('records'),
             "weather": engine.get_weather_summary(session),
             "session_name": session.name,
             "ideal_laps": ideal_laps_dict,
             "team_ratings": team_ratings_dict,
+            "constructor_maturity": maturities_dict,
+            "sunday_conversion": sunday_conv_dict,
             "lap_counts": lap_counts_dict,
             "consistency": consistency_dict,
             "long_stint_pace": long_stint_dict
@@ -264,6 +291,7 @@ async def get_current_prediction(session_type: str = "Q"):
         long_stint_dict = {}
         maturities_dict = {}
         rookie_flags = {}
+        sunday_conversions = {}
         
         data_sources = {
             "type": "none",
@@ -302,19 +330,20 @@ async def get_current_prediction(session_type: str = "Q"):
                     team_ratings_dict[team] = rating
                     maturities_dict[team] = 1.0
 
-            # Dynamic Rookie Detection (check if they have < 10 races in career)
+            # Dynamic Rookie Detection (check career race count across 2023-2025)
             abbr = driver["Abbreviation"]
             if abbr not in rookie_flags:
-                try:
-                    # In a real app we'd query career history. For this engine:
-                    # We'll treat drivers not in 2023/2024 results as rookies
-                    hist_search = engine.get_event_schedule(2024)
-                    rookie_flags[abbr] = False 
-                    # If they are in the hardcoded rookie list, stick with it for the sim
-                    if abbr in ["ANT", "BEA", "HAD", "DOO", "BOR"]:
-                        rookie_flags[abbr] = True
-                except:
-                    rookie_flags[abbr] = False
+                race_count = engine.get_driver_race_count(abbr)
+                rookie_flags[abbr] = race_count < 10
+                if rookie_flags[abbr]:
+                    data_sources["notes"].append(f"{abbr} flagged as rookie (<10 races)")
+
+            # Sunday Conversion Factor (for Race predictions)
+            if session_type == 'R' and team not in sunday_conversions:
+                sunday_conversions[team] = engine.get_sunday_conversion_factor(team)
+                if abs(sunday_conversions[team]) > 0.005:
+                    label = "Sunday car" if sunday_conversions[team] > 0 else "Saturday car"
+                    data_sources["notes"].append(f"{team}: {label} ({sunday_conversions[team]:+.1%})")
 
         # 3. Try current year practice data (Live Data)
         baseline_ids = ['FP3', 'FP2', 'FP1']
@@ -347,29 +376,46 @@ async def get_current_prediction(session_type: str = "Q"):
                 
                 # Base time for synthetic reconstruction
                 base_time = 90.0
-                mapped_laps = {}
                 
-                # Map historical drivers and apply CAR PENALTY (Decoupling)
-                for drv, hist_delta in history["deltas"].items():
-                    # Find which team this driver was on in that historical period (approximate as their 2025/2024 team)
-                    # For simplicity, we compare their historical performance to current 2026 team strength
-                    
-                    found_current = next((d for d in current_grid if d["Abbreviation"] == drv), None)
-                    if found_current:
-                        team_2026 = found_current["TeamName"]
-                        rating_2026 = team_ratings_dict.get(team_2026, 0.5)
+                # Fetch historical session details to get DYNAMIC car ratings
+                # We normalize the historical car based on its performance in that exact session
+                for yr_idx, yr in enumerate(history["years_searched"]):
+                    try:
+                        h_session = engine.get_session(yr, circuit_name, history_type)
+                        h_laps = h_session.laps.pick_quicklaps()
+                        if h_laps.empty: continue
                         
-                        # Fix "Verstappen Effect": Verstappen in 2023 Red Bull (~1.0) vs 2026 Red Bull (~0.6)
-                        # We assume history[drv] was set in a 0.95 rated car on average
-                        hist_car_rating = 0.95 if drv in ["VER", "LEC", "HAM", "NOR"] else 0.6
-                        if drv == "VER": hist_car_rating = 1.0 # Peak dominance
+                        pole_h = h_laps['LapTime'].min().total_seconds()
                         
-                        car_slump_penalty = (hist_car_rating - rating_2026) * 4.0 # 4s spread
-                        adjusted_delta = hist_delta + max(0, car_slump_penalty)
-                        ideal_laps_dict[drv] = base_time + adjusted_delta
-                    else:
-                        # Driver not on current grid, store for teammate inheritance later
-                        ideal_laps_dict[drv] = base_time + hist_delta
+                        # Map historical drivers for this year
+                        for drv, hist_delta in history["deltas"].items():
+                            found_current = next((d for d in current_grid if d["Abbreviation"] == drv), None)
+                            if not found_current:
+                                ideal_laps_dict[drv] = base_time + hist_delta
+                                continue
+
+                            # Calculate what the car rating was for this specific driver/team in history
+                            team_h = h_laps[h_laps['Driver'] == drv]['Team'].iloc[0]
+                            team_h_best = h_laps[h_laps['Team'] == team_h]['LapTime'].min().total_seconds()
+                            h_deficit = (team_h_best - pole_h) / pole_h
+                            
+                            # Map deficit to rating (same logic as get_rolling_team_rating)
+                            if h_deficit <= 0.05: hist_car_rating = 1.0
+                            elif h_deficit <= 1.0: hist_car_rating = 1.0 - (h_deficit * 0.3)
+                            else: hist_car_rating = max(0.2, 0.7 - ((h_deficit - 1.0) * (0.5 / 1.5))) # 0.2 FLOOR
+                            
+                            team_2026 = found_current["TeamName"]
+                            rating_2026 = team_ratings_dict.get(team_2026, 0.5)
+                            
+                            # Apply Decoupling Penalty
+                            car_slump_penalty = (hist_car_rating - rating_2026) * 4.0
+                            adjusted_delta = hist_delta + max(0, car_slump_penalty)
+                            ideal_laps_dict[drv] = base_time + adjusted_delta
+                            
+                        break # Successfully processed one historical year for decoupling
+                    except: continue
+
+                data_sources["notes"].append("Applied 100% dynamic car-performance decoupling.")
 
                 data_sources["notes"].append("Applied car-performance decoupling to historical times.")
 
@@ -420,6 +466,7 @@ async def get_current_prediction(session_type: str = "Q"):
             "ideal_laps": final_mapped_laps,
             "team_ratings": team_ratings_dict,
             "constructor_maturity": maturities_dict,
+            "sunday_conversion": sunday_conversions,
             "lap_counts": lap_counts_dict,
             "consistency": consistency_dict,
             "long_stint_pace": long_stint_dict

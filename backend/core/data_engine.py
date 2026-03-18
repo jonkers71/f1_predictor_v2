@@ -19,6 +19,7 @@ fastf1.Cache.enable_cache(CACHE_DIR)
 class F1DataEngine:
     def __init__(self, cache_dir: str = CACHE_DIR):
         self.cache_dir = cache_dir
+        self._driver_history_cache = {} # Memoization for race counts
         logger.info(f"F1DataEngine initialized with cache: {self.cache_dir}")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -152,6 +153,38 @@ class F1DataEngine:
         except Exception as e:
             logger.error(f"Error getting consistency: {e}")
             return {}
+    def get_driver_race_count(self, driver_abbr: str, years: List[int] = None) -> int:
+        """
+        Check how many total race entries a driver has across the specified years.
+        Used for dynamic rookie detection. Results are memoized.
+        """
+        if years is None:
+            years = [2023, 2024, 2025]
+            
+        cache_key = f"{driver_abbr}_{''.join(map(str, years))}"
+        if cache_key in self._driver_history_cache:
+            return self._driver_history_cache[cache_key]
+            
+        total_races = 0
+        for year in years:
+            try:
+                schedule = self.get_event_schedule(year)
+                if schedule.empty: continue
+                
+                # Check each completed race session for the driver
+                for _, event in schedule[schedule['RoundNumber'] > 0].iterrows():
+                    try:
+                        # We use results directly as it's faster than loading full sessions
+                        # Note: This might still trigger some API calls if results aren't cached
+                        results = fastf1.get_session(year, int(event['RoundNumber']), 'R').results
+                        if not results.empty and driver_abbr in results['Abbreviation'].values:
+                            total_races += 1
+                    except: continue
+            except Exception as e:
+                logger.warning(f"Error counting races for {driver_abbr} in {year}: {e}")
+                
+        self._driver_history_cache[cache_key] = total_races
+        return total_races
 
     def get_rolling_team_rating(self, team_name: str, year: int, current_round: int, window: int = 3) -> float:
         """
@@ -196,8 +229,9 @@ class F1DataEngine:
                     continue
             
             if not deficits:
-                # Fallback to static if no recent data
-                return self.get_team_rating(team_name)
+                # Fallback to maturity-aware defaults (0.5 established, 0.1 new)
+                maturity = self.get_constructor_maturity(team_name)
+                return 0.5 if maturity >= 1.0 else 0.1
             
             avg_deficit = np.mean(deficits)
             
@@ -371,18 +405,18 @@ class F1DataEngine:
             "drivers_found": len(avg_deltas)
         }
 
-    def get_long_stint_pace(self, session) -> Dict[str, float]:
+    def get_long_stint_pace(self, session) -> Dict[str, Dict[str, float]]:
         """
-        Extracts long stint average pace from a practice session.
-        A 'long stint' is 5+ consecutive laps on the same compound.
-        Returns {driver_abbr: avg_lap_time_seconds} for race pace estimation.
+        Extracts high-fidelity stint profile from a practice session.
+        Uses np.polyfit to calculate degradation slope and base pace intercept.
+        Returns {driver_abbr: {slope, intercept, variance}}
         """
         try:
             laps = session.laps
             if laps.empty:
                 return {}
             
-            long_stint_paces = {}
+            stint_profiles = {}
             
             for driver in laps['Driver'].unique():
                 driver_laps = laps.pick_drivers(driver).sort_values('LapNumber')
@@ -390,9 +424,9 @@ class F1DataEngine:
                 if driver_laps.empty or len(driver_laps) < 5:
                     continue
                 
-                # Find consecutive laps on the same compound
-                best_stint_pace = None
-                current_stint = []
+                # Find best long stint profile
+                best_profile = None
+                current_stint_laps = []
                 current_compound = None
                 
                 for _, lap in driver_laps.iterrows():
@@ -400,38 +434,115 @@ class F1DataEngine:
                     lap_time = lap['LapTime']
                     
                     if pd.isna(lap_time):
-                        current_stint = []
+                        current_stint_laps = []
                         current_compound = None
                         continue
                     
                     lap_seconds = lap_time.total_seconds()
                     
-                    # Skip obvious outliers (pit laps, safety car, etc.)
-                    if lap_seconds > 200 or lap_seconds < 60:
-                        current_stint = []
+                    # Outlier Rejection: skip pit laps, safety cars, or laps > 1.5s slower than previous
+                    is_outlier = lap_seconds > 200 or lap_seconds < 60
+                    if not is_outlier and current_stint_laps:
+                        if lap_seconds > (current_stint_laps[-1] + 1.5):
+                            is_outlier = True
+                    
+                    if is_outlier:
+                        current_stint_laps = []
                         current_compound = None
                         continue
                     
                     if compound == current_compound:
-                        current_stint.append(lap_seconds)
+                        current_stint_laps.append(lap_seconds)
                     else:
                         current_compound = compound
-                        current_stint = [lap_seconds]
+                        current_stint_laps = [lap_seconds]
                     
-                    # If we have a stint of 5+ laps, calculate average
-                    if len(current_stint) >= 5:
-                        # Drop the first lap (outlap/adjustment) and calculate
-                        stint_pace = np.mean(current_stint[1:])
-                        if best_stint_pace is None or stint_pace < best_stint_pace:
-                            best_stint_pace = stint_pace
+                    # If we have a stint of 5+ laps, analyze it
+                    if len(current_stint_laps) >= 5:
+                        # 1. Slope & Intercept via linear regression
+                        # x = lap index (0 to N), y = lap times
+                        x = np.arange(len(current_stint_laps))
+                        y = np.array(current_stint_laps)
+                        
+                        slope, intercept = np.polyfit(x, y, 1)
+                        
+                        # 2. Variance (Stability)
+                        # We remove the slope trend first to see the driver's inherent consistency
+                        trendline = (slope * x) + intercept
+                        detrended_variance = np.var(y - trendline)
+                        
+                        # 3. Quality check: only accept positive slopes (real wear) or very flat ones
+                        # A massive negative slope suggests they were lifting/coasting earlier
+                        if best_profile is None or intercept < best_profile['intercept']:
+                            best_profile = {
+                                "slope": float(slope),
+                                "intercept": float(intercept),
+                                "variance": float(detrended_variance)
+                            }
                 
-                if best_stint_pace is not None:
-                    long_stint_paces[driver] = float(best_stint_pace)
+                if best_profile:
+                    stint_profiles[driver] = best_profile
             
-            return long_stint_paces
+            return stint_profiles
         except Exception as e:
-            logger.error(f"Error extracting long stint pace: {e}")
+            logger.error(f"Error calculating high-fidelity stint pace: {e}")
             return {}
+
+    def get_sunday_conversion_factor(self, team_name: str, years: List[int] = None, count: int = 5) -> float:
+        """
+        Calculates the average Qualy vs Race pace delta for a team over last N races.
+        Only uses 'Green Flag' (TrackStatus == '1') laps.
+        Positive = better in race than qualy, Negative = 'Saturday car'.
+        """
+        if years is None:
+            years = [2026, 2025]
+            
+        deltas = []
+        try:
+            for year in years:
+                schedule = self.get_event_schedule(year)
+                if schedule.empty: continue
+                
+                # Check recent races
+                races = schedule[schedule['RoundNumber'] > 0].iloc[::-1]
+                for _, event in races.iterrows():
+                    try:
+                        # 1. Qualy Delta for Team
+                        q_session = fastf1.get_session(year, int(event['RoundNumber']), 'Q')
+                        q_session.load()
+                        q_laps = q_session.laps.pick_quicklaps()
+                        if q_laps.empty: continue
+                        
+                        pole_time = q_laps['LapTime'].min().total_seconds()
+                        team_q_best = q_laps[q_laps['Team'] == team_name]['LapTime'].min().total_seconds()
+                        q_pct_deficit = (team_q_best - pole_time) / pole_time
+                        
+                        # 2. Race Delta for Team (Green Laps Only)
+                        r_session = fastf1.get_session(year, int(event['RoundNumber']), 'R')
+                        r_session.load()
+                        # Filter TrackStatus '1' (Green) and valid lap times
+                        r_laps = r_session.laps[r_session.laps['TrackStatus'] == '1'].dropna(subset=['LapTime'])
+                        if r_laps.empty: continue
+                        
+                        # Compare team average race lap to winner average race lap
+                        winner = r_session.results.sort_values('Position').iloc[0]['Abbreviation']
+                        winner_avg = r_laps[r_laps['Driver'] == winner]['LapTime'].dt.total_seconds().mean()
+                        team_avg = r_laps[r_laps['Team'] == team_name]['LapTime'].dt.total_seconds().mean()
+                        r_pct_deficit = (team_avg - winner_avg) / winner_avg
+                        
+                        # Conversion = Qualy Deficit - Race Deficit
+                        # e.g. If Q is 1% off and R is 0.5% off, conversion is +0.5% (Sunday car)
+                        conversion = q_pct_deficit - r_pct_deficit
+                        deltas.append(conversion)
+                        
+                        if len(deltas) >= count: break
+                    except: continue
+                if len(deltas) >= count: break
+                
+            return float(np.mean(deltas)) if deltas else 0.0
+        except Exception as e:
+            logger.error(f"Error calculating Sunday conversion for {team_name}: {e}")
+            return 0.0
 
     def get_next_event(self) -> Dict[str, Any]:
         """Identifies the next upcoming event from the 2026 schedule."""

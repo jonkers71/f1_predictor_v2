@@ -3,21 +3,19 @@
 import React from 'react';
 
 interface Weights {
-  pace: number;
+  base: number;
+  slope: number;
+  consistency: number;
+  conversion: number;
   team: number;
-  reliability: number;
-  rookie: number;
-  long_stint?: number;
-  maturity: number;
 }
 
 interface Breakdown {
-  pace_score: number;
+  base_score: number;
+  slope_score: number;
+  consistency_score: number;
+  sunday_conversion: number;
   team_score: number;
-  reliability_score: number;
-  rookie_score: number;
-  maturity_score: number;
-  stint_score?: number;
   final_score: number;
   weights: Weights;
 }
@@ -28,23 +26,15 @@ interface WeightingBreakdownProps {
 }
 
 const WeightingBreakdown: React.FC<WeightingBreakdownProps> = ({ breakdown, driverName }) => {
-  const { pace_score, team_score, reliability_score, rookie_score, maturity_score, stint_score, weights } = breakdown;
+  const { base_score, slope_score, consistency_score, sunday_conversion, team_score, weights } = breakdown;
   
   const items = [
-    { label: 'Raw Pace', value: pace_score, weight: weights.pace, color: '#66fcf1' },
-  ];
-  
-  // Add long stint only when present (race predictions with practice data)
-  if (weights.long_stint && stint_score !== undefined) {
-    items.push({ label: 'Long Stint Pace', value: stint_score, weight: weights.long_stint, color: '#4ecdc4' });
-  }
-  
-  items.push(
+    { label: 'Base Pace', value: base_score, weight: weights.base, color: '#66fcf1' },
+    { label: 'Tyre Wear (Slope)', value: slope_score, weight: weights.slope, color: '#ff5252' },
+    { label: 'Variance (Consistency)', value: consistency_score, weight: weights.consistency, color: '#4ecdc4' },
+    { label: 'Sunday Conv', value: -sunday_conversion, weight: weights.conversion, color: '#f7f1e3' },
     { label: 'Team Strength', value: team_score, weight: weights.team, color: '#45a29e' },
-    { label: 'Reliability', value: reliability_score, weight: weights.reliability, color: '#f7f1e3' },
-    { label: 'Rookie Var', value: rookie_score, weight: weights.rookie, color: '#ff5252' },
-    { label: 'Team Maturity', value: maturity_score, weight: weights.maturity, color: '#ff793f' },
-  );
+  ];
 
   return (
     <div className="bg-[#0b0c10] p-4 rounded-xl border border-[#45a29e]/30 mt-4 animate-in fade-in zoom-in-95 duration-300">

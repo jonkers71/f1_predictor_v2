@@ -7,19 +7,19 @@ import Calendar from "@/components/Calendar";
 import WeightingBreakdown from "@/components/WeightingBreakdown";
 
 interface Weights {
-  pace: number;
+  base: number;
+  slope: number;
+  consistency: number;
+  conversion: number;
   team: number;
-  reliability: number;
-  rookie: number;
-  long_stint?: number;
 }
 
 interface Breakdown {
-  pace_score: number;
+  base_score: number;
+  slope_score: number;
+  consistency_score: number;
+  sunday_conversion: number;
   team_score: number;
-  reliability_score: number;
-  rookie_score: number;
-  stint_score?: number;
   final_score: number;
   weights: Weights;
 }
@@ -60,6 +60,7 @@ export default function Dashboard() {
   const [baseline, setBaseline] = useState<string>("");
   const [predictionError, setPredictionError] = useState<string>("");
   const [dataSources, setDataSources] = useState<DataSources | null>(null);
+  const [modelStatus, setModelStatus] = useState<{status: string, last_trained: string, feature_version: string} | null>(null);
 
   const fetchPredictions = (type: "Q" | "R") => {
     setPredictionError("");
@@ -92,6 +93,10 @@ export default function Dashboard() {
           setLastSynced(!isNaN(d.getTime()) ? d.toLocaleTimeString() : "Never");
         }
       })
+    // Model Status
+    fetch("http://localhost:8000/model/status")
+      .then(res => res.json())
+      .then(data => setModelStatus(data))
       .catch(() => {});
 
     // Initial data fetch
@@ -319,6 +324,32 @@ export default function Dashboard() {
                   ))}
                 </div>
               )}
+            </div>
+          </div>
+          {/* Model Health Status */}
+          <div className="bg-[#1f2833] rounded-2xl p-6 border border-[#45a29e]/20">
+            <h3 className="text-sm font-bold text-[#45a29e] uppercase tracking-widest mb-4">
+              XGBoost Agent Status
+            </h3>
+            <div className="space-y-4">
+              <div className="flex justify-between text-sm">
+                <span>Model State</span>
+                <span className={`font-mono font-bold ${modelStatus?.status === 'active' ? 'text-green-400' : 'text-red-400'}`}>
+                  {modelStatus?.status?.toUpperCase() || 'OFFLINE'}
+                </span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span>Last Trained</span>
+                <span className="text-[#66fcf1] font-mono text-xs">
+                  {modelStatus?.last_trained !== 'never' 
+                    ? new Date(modelStatus!.last_trained).toLocaleString() 
+                    : 'System Default'}
+                </span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span>Feature Set</span>
+                <span className="text-[#45a29e] font-mono text-[10px]">{modelStatus?.feature_version || 'v1.0'}</span>
+              </div>
             </div>
           </div>
         </aside>
