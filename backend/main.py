@@ -5,6 +5,7 @@ import logging
 import pandas as pd
 from datetime import datetime
 import numpy as np
+import os
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -297,7 +298,7 @@ async def get_current_prediction(session_type: str = "Q"):
             "type": "none",
             "circuit": circuit_name,
             "sessions_used": [],
-            "dynamic_pecking_order": True,
+            "current_season_adjustment": True,
             "has_long_stint_data": False,
             "notes": []
         }
