@@ -84,7 +84,7 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
-    // Restore sync timestamp from backend
+    // Restore sync timestamp
     fetch("http://localhost:8000/sync/status")
       .then(res => res.json())
       .then(data => {
@@ -93,11 +93,15 @@ export default function Dashboard() {
           setLastSynced(!isNaN(d.getTime()) ? d.toLocaleTimeString() : "Never");
         }
       })
-    // Model Status
-    fetch("http://localhost:8000/model/status")
-      .then(res => res.json())
-      .then(data => setModelStatus(data))
       .catch(() => {});
+
+    // Model Status (Force separate chain)
+    setTimeout(() => {
+      fetch("http://localhost:8000/model/status")
+        .then(res => res.json())
+        .then(data => setModelStatus(data))
+        .catch(err => console.error("Model status fetch failed:", err));
+    }, 500);
 
     // Initial data fetch
     fetch("http://localhost:8000/active_event")
