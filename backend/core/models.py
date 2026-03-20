@@ -168,6 +168,23 @@ class F1PredictorModel:
         # Build breakdown for transparency
         breakdown = []
         for i in range(len(X)):
+            # Confidence Score (0-100): deduct points for missing or uncertain data
+            confidence = 100
+            confidence_reasons = []
+            if X["has_long_stint"].iloc[i] == 0:
+                confidence -= 30
+                confidence_reasons.append("No long stint data")
+            if X["is_rookie"].iloc[i] == 1:
+                confidence -= 20
+                confidence_reasons.append("Rookie driver")
+            if X["constructor_maturity"].iloc[i] < 1.0:
+                confidence -= 15
+                confidence_reasons.append("New constructor")
+            if X["team_strength"].iloc[i] < 0.2:
+                confidence -= 10
+                confidence_reasons.append("Rating proxy used")
+            confidence = max(0, confidence)
+
             bd = {
                 "base_score": float(base_scores.iloc[i]),
                 "slope_score": float(slope_scores.iloc[i]),
@@ -175,6 +192,8 @@ class F1PredictorModel:
                 "sunday_conversion": float(conv_bonus.iloc[i]),
                 "team_score": float(latent_scores.iloc[i]),
                 "final_score": float(final_scores.iloc[i]),
+                "confidence_score": confidence,
+                "confidence_reasons": confidence_reasons,
                 "weights": {
                     "base": w_base,
                     "slope": w_slope,

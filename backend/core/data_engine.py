@@ -544,6 +544,178 @@ class F1DataEngine:
             logger.error(f"Error calculating Sunday conversion for {team_name}: {e}")
             return 0.0
 
+    def run_full_sync(self, update_callback=None) -> Dict[str, Any]:
+        """
+        Runs a staged data sync pipeline, downloading all sessions required
+        for accurate predictions into the local FastF1 cache.
+        Calls update_callback(progress_pct, stage_name) after each stage.
+        """
+        def _update(pct: int, stage: str):
+            logger.info(f"[Sync] {pct}% - {stage}")
+            if update_callback:
+                update_callback(pct, stage)
+
+        results = {"stages": [], "errors": []}
+
+        # Stage 1: Load schedules for 2024, 2025, 2026
+        _update(5, "Loading race schedules (2024-2026)...")
+        schedules = {}
+        for yr in [2024, 2025, 2026]:
+            try:
+                schedules[yr] = self.get_event_schedule(yr)
+                results["stages"].append(f"Schedule {yr}: OK ({len(schedules[yr])} events)")
+            except Exception as e:
+                results["errors"].append(f"Schedule {yr}: {e}")
+        _update(10, "Schedules loaded.")
+
+        # Stage 2: Cache race results for rookie detection (2023-2025)
+        _update(12, "Caching race results for rookie detection (2023-2025)...")
+        rookie_sessions_loaded = 0
+        for yr in [2023, 2024, 2025]:
+            try:
+                sched = schedules.get(yr) if yr in schedules else self.get_event_schedule(yr)
+                if sched is None or sched.empty:
+                    continue
+                past_rounds = sched[sched['RoundNumber'] > 0]
+                total = len(past_rounds)
+                for idx, (_, event) in enumerate(past_rounds.iterrows()):
+                    try:
+                        session = fastf1.get_session(yr, int(event['RoundNumber']), 'R')
+                        session.load(laps=False, telemetry=False, weather=False, messages=False)
+                        rookie_sessions_loaded += 1
+                    except:
+                        pass
+                    # Update progress within Stage 2 (12% -> 40%)
+                    stage_pct = 12 + int(((yr - 2023) * total + idx + 1) / (3 * max(total, 1)) * 28)
+                    _update(stage_pct, f"Caching {yr} race results ({idx+1}/{total})...")
+            except Exception as e:
+                results["errors"].append(f"Rookie data {yr}: {e}")
+        results["stages"].append(f"Rookie detection data: {rookie_sessions_loaded} sessions cached")
+        _update(40, "Race results cached.")
+
+        # Stage 3: Cache last 5 qualifying + race sessions for Sunday Conversion
+        _update(42, "Caching recent sessions for Sunday Conversion factor...")
+        conv_sessions_loaded = 0
+        for yr in [2025, 2026]:
+            try:
+                sched = schedules.get(yr) if yr in schedules else self.get_event_schedule(yr)
+                if sched is None or sched.empty:
+                    continue
+                past_rounds = sched[sched['RoundNumber'] > 0].iloc[::-1].head(5)
+                for _, event in past_rounds.iterrows():
+                    for sid in ['Q', 'R']:
+                        try:
+                            session = fastf1.get_session(yr, int(event['RoundNumber']), sid)
+                            session.load(telemetry=False, messages=False)
+                            conv_sessions_loaded += 1
+                        except:
+                            pass
+            except Exception as e:
+                results["errors"].append(f"Sunday conversion data {yr}: {e}")
+        results["stages"].append(f"Sunday conversion data: {conv_sessions_loaded} sessions cached")
+        _update(65, "Sunday conversion sessions cached.")
+
+        # Stage 4: Cache upcoming circuit history (2023-2025)
+        _update(67, "Caching upcoming circuit history...")
+        try:
+            next_event = self.get_next_event()
+            circuit = next_event.get('country', next_event.get('name', ''))
+            circuit_sessions_loaded = 0
+            for yr in [2023, 2024, 2025]:
+                for sid in ['Q', 'R', 'FP2']:
+                    try:
+                        session = fastf1.get_session(yr, circuit, sid)
+                        session.load(telemetry=False, messages=False)
+                        circuit_sessions_loaded += 1
+                    except:
+                        pass
+            results["stages"].append(f"Circuit history ({circuit}): {circuit_sessions_loaded} sessions cached")
+            _update(90, f"Circuit history for {circuit} cached.")
+        except Exception as e:
+            results["errors"].append(f"Circuit history: {e}")
+
+        # Stage 5: Cache rolling team rating sessions (last 3 rounds of current year)
+        _update(92, "Caching rolling team rating sessions...")
+        try:
+            sched_2026 = schedules.get(2026) if 2026 in schedules else self.get_event_schedule(2026)
+            if sched_2026 is not None and not sched_2026.empty:
+                past = sched_2026[sched_2026['RoundNumber'] > 0].iloc[::-1].head(3)
+                for _, event in past.iterrows():
+                    try:
+                        session = fastf1.get_session(2026, int(event['RoundNumber']), 'Q')
+                        session.load(telemetry=False, messages=False)
+                    except:
+                        pass
+            results["stages"].append("Rolling team ratings: sessions cached")
+        except Exception as e:
+            results["errors"].append(f"Rolling ratings: {e}")
+
+        _update(100, "Sync complete.")
+        return results
+
+    def check_cache_health(self) -> Dict[str, Any]:
+        """
+        Inspects the local FastF1 cache directory and returns a structured
+        health report for each data layer the predictor depends on.
+        """
+        health = {
+            "cache_dir": self.cache_dir,
+            "cache_exists": os.path.exists(self.cache_dir),
+            "total_sessions_cached": 0,
+            "layers": {
+                "rookie_data": {"status": "missing", "detail": "No 2023-2025 race results cached"},
+                "sunday_conversion": {"status": "missing", "detail": "No recent Q/R sessions cached"},
+                "circuit_history": {"status": "missing", "detail": "No upcoming circuit history cached"},
+                "rolling_ratings": {"status": "missing", "detail": "No recent qualifying sessions cached"},
+            }
+        }
+
+        if not health["cache_exists"]:
+            return health
+
+        # Walk the cache directory and count session files
+        session_files = []
+        for root, dirs, files in os.walk(self.cache_dir):
+            for f in files:
+                if f.endswith('.ff1') or f.endswith('.pkl') or f.endswith('.json'):
+                    session_files.append(os.path.join(root, f))
+        health["total_sessions_cached"] = len(session_files)
+
+        # Check for rookie data: need 2023/2024/2025 race files
+        rookie_files = [f for f in session_files if any(str(yr) in f for yr in ['2023', '2024', '2025'])]
+        if len(rookie_files) >= 10:
+            health["layers"]["rookie_data"] = {"status": "ready", "detail": f"{len(rookie_files)} historical session files found"}
+        elif len(rookie_files) > 0:
+            health["layers"]["rookie_data"] = {"status": "partial", "detail": f"{len(rookie_files)} historical session files found (need ~20+)"}
+
+        # Check for sunday conversion: need recent 2025/2026 files
+        recent_files = [f for f in session_files if any(str(yr) in f for yr in ['2025', '2026'])]
+        if len(recent_files) >= 6:
+            health["layers"]["sunday_conversion"] = {"status": "ready", "detail": f"{len(recent_files)} recent session files found"}
+        elif len(recent_files) > 0:
+            health["layers"]["sunday_conversion"] = {"status": "partial", "detail": f"{len(recent_files)} recent session files found (need 6+)"}
+
+        # Check for circuit history: try to find next event circuit in cache
+        try:
+            next_event = self.get_next_event()
+            circuit = next_event.get('country', next_event.get('name', '')).lower()
+            circuit_files = [f for f in session_files if circuit.lower() in f.lower()]
+            if len(circuit_files) >= 3:
+                health["layers"]["circuit_history"] = {"status": "ready", "detail": f"{len(circuit_files)} files for {circuit}"}
+            elif len(circuit_files) > 0:
+                health["layers"]["circuit_history"] = {"status": "partial", "detail": f"{len(circuit_files)} files for {circuit} (need 3+)"}
+        except:
+            pass
+
+        # Check for rolling ratings: need 2026 qualifying files
+        rating_files = [f for f in session_files if '2026' in f]
+        if len(rating_files) >= 3:
+            health["layers"]["rolling_ratings"] = {"status": "ready", "detail": f"{len(rating_files)} 2026 session files found"}
+        elif len(rating_files) > 0:
+            health["layers"]["rolling_ratings"] = {"status": "partial", "detail": f"{len(rating_files)} 2026 session files found (need 3+)"}
+
+        return health
+
     def get_next_event(self) -> Dict[str, Any]:
         """Identifies the next upcoming event from the 2026 schedule."""
         try:
