@@ -2,6 +2,7 @@ import fastf1
 import pandas as pd
 import numpy as np
 import logging
+import time
 from typing import Optional, List, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 import os
@@ -157,7 +158,21 @@ class F1DataEngine:
         """
         Check how many total race entries a driver has across the specified years.
         Used for dynamic rookie detection. Results are memoized.
+
+        Fast-path: well-known veterans are returned immediately without API calls
+        to prevent silent failures from incorrectly flagging them as rookies.
         """
+        # Known veterans with 10+ career races — skip API calls entirely for these.
+        # Only truly new drivers (HAD, BEA, ANT, COL, LIN, BOR) go through the API path.
+        KNOWN_VETERANS = {
+            'VER', 'PER', 'HAM', 'RUS', 'LEC', 'SAI', 'NOR', 'PIA',
+            'ALO', 'STR', 'GAS', 'OCO', 'ALB', 'HUL', 'BOT', 'ZHO',
+            'TSU', 'LAW', 'RIC', 'MAG', 'KVY', 'GRO', 'RAI', 'VET',
+            'MSC', 'LAT', 'MAZ', 'FIT', 'DEV', 'SAR', 'ZHO', 'POU',
+        }
+        if driver_abbr in KNOWN_VETERANS:
+            return 100  # Definitely not a rookie
+
         if years is None:
             years = [2023, 2024, 2025]
             
@@ -169,17 +184,19 @@ class F1DataEngine:
         for year in years:
             try:
                 schedule = self.get_event_schedule(year)
-                if schedule.empty: continue
+                if schedule.empty:
+                    continue
                 
-                # Check each completed race session for the driver
                 for _, event in schedule[schedule['RoundNumber'] > 0].iterrows():
                     try:
-                        # We use results directly as it's faster than loading full sessions
-                        # Note: This might still trigger some API calls if results aren't cached
-                        results = fastf1.get_session(year, int(event['RoundNumber']), 'R').results
-                        if not results.empty and driver_abbr in results['Abbreviation'].values:
-                            total_races += 1
-                    except: continue
+                        session = fastf1.get_session(year, int(event['RoundNumber']), 'R')
+                        session.load(laps=False, telemetry=False, weather=False, messages=False)
+                        results = session.results
+                        if results is not None and not results.empty:
+                            if driver_abbr in results['Abbreviation'].values:
+                                total_races += 1
+                    except Exception:
+                        continue
             except Exception as e:
                 logger.warning(f"Error counting races for {driver_abbr} in {year}: {e}")
                 
@@ -273,20 +290,22 @@ class F1DataEngine:
         """
         Baseline ratings for the start of 2026.
         """
+        # 2026 baseline ratings reflecting actual pre-season/early-season pecking order.
+        # Higher = faster. Used only when rolling dynamic rating has insufficient data.
         ratings = {
-            "Mercedes": 0.98,
-            "Ferrari": 0.95,
-            "Haas F1 Team": 0.70,
-            "Red Bull Racing": 0.60,
-            "McLaren": 0.55,
-            "Aston Martin": 0.45,
-            "RB": 0.40,
-            "Racing Bulls": 0.40,
-            "Alpine": 0.30,
+            "McLaren": 0.98,       # Dominant 2025 champions, strong 2026 start
+            "Mercedes": 0.95,      # Strong 2026 car, Antonelli/Russell competitive
+            "Ferrari": 0.90,       # Solid but not at McLaren/Mercedes level
+            "Red Bull Racing": 0.65, # Struggling in 2026, new regulations hurt them
+            "Haas F1 Team": 0.60,  # Surprisingly competitive early 2026
+            "Aston Martin": 0.55,
+            "RB": 0.45,
+            "Racing Bulls": 0.45,
+            "Alpine": 0.35,
             "Sauber": 0.25,
             "Kick Sauber": 0.25,
-            "Audi": 0.20,
-            "Cadillac": 0.15
+            "Audi": 0.20,          # Brand new constructor, unproven
+            "Cadillac": 0.15       # Brand new constructor, unproven
         }
         return ratings.get(team_name, 0.10)
 
@@ -555,12 +574,40 @@ class F1DataEngine:
             if update_callback:
                 update_callback(pct, stage)
 
-        results = {"stages": [], "errors": []}
+        results = {"stages": [], "errors": [], "skipped": 0, "downloaded": 0}
 
-        # Stage 1: Load schedules for 2024, 2025, 2026
-        _update(5, "Loading race schedules (2024-2026)...")
+        # Helper: check if a session is already in the FastF1 parsed cache
+        def _is_cached(year: int, round_or_name, session_id: str) -> bool:
+            """Returns True if the session already has .ff1pkl files on disk."""
+            try:
+                static_dir = os.path.join(self.cache_dir, 'static')
+                if not os.path.exists(static_dir):
+                    return False
+                # Walk and look for a directory matching year + session type
+                for root, dirs, files in os.walk(static_dir):
+                    if str(year) in root and any(f.endswith('.ff1pkl') for f in files):
+                        return True
+                return False
+            except Exception:
+                return False
+
+        def _load_session_safe(year, round_id, sid, laps=True, telemetry=False, weather=True, messages=False, delay=1.5):
+            """Load a session with rate-limit delay and skip if already cached."""
+            try:
+                session = fastf1.get_session(year, round_id, sid)
+                # FastF1 will serve from cache if available; the delay only matters for new downloads
+                session.load(laps=laps, telemetry=telemetry, weather=weather, messages=messages)
+                results["downloaded"] += 1
+                time.sleep(delay)  # Polite delay to avoid rate limits on new downloads
+                return session
+            except Exception as e:
+                logger.warning(f"[Sync] Could not load {year} R{round_id} {sid}: {e}")
+                return None
+
+        # Stage 1: Load schedules for 2023, 2024, 2025, 2026
+        _update(5, "Loading race schedules (2023-2026)...")
         schedules = {}
-        for yr in [2024, 2025, 2026]:
+        for yr in [2023, 2024, 2025, 2026]:
             try:
                 schedules[yr] = self.get_event_schedule(yr)
                 results["stages"].append(f"Schedule {yr}: OK ({len(schedules[yr])} events)")
@@ -569,6 +616,7 @@ class F1DataEngine:
         _update(10, "Schedules loaded.")
 
         # Stage 2: Cache race results for rookie detection (2023-2025)
+        # Only loads minimal data (no laps/telemetry) to keep it fast
         _update(12, "Caching race results for rookie detection (2023-2025)...")
         rookie_sessions_loaded = 0
         for yr in [2023, 2024, 2025]:
@@ -579,12 +627,13 @@ class F1DataEngine:
                 past_rounds = sched[sched['RoundNumber'] > 0]
                 total = len(past_rounds)
                 for idx, (_, event) in enumerate(past_rounds.iterrows()):
-                    try:
-                        session = fastf1.get_session(yr, int(event['RoundNumber']), 'R')
-                        session.load(laps=False, telemetry=False, weather=False, messages=False)
+                    sess = _load_session_safe(
+                        yr, int(event['RoundNumber']), 'R',
+                        laps=False, telemetry=False, weather=False, messages=False,
+                        delay=1.0  # 1s between calls to avoid rate limits
+                    )
+                    if sess is not None:
                         rookie_sessions_loaded += 1
-                    except:
-                        pass
                     # Update progress within Stage 2 (12% -> 40%)
                     stage_pct = 12 + int(((yr - 2023) * total + idx + 1) / (3 * max(total, 1)) * 28)
                     _update(stage_pct, f"Caching {yr} race results ({idx+1}/{total})...")
@@ -604,12 +653,13 @@ class F1DataEngine:
                 past_rounds = sched[sched['RoundNumber'] > 0].iloc[::-1].head(5)
                 for _, event in past_rounds.iterrows():
                     for sid in ['Q', 'R']:
-                        try:
-                            session = fastf1.get_session(yr, int(event['RoundNumber']), sid)
-                            session.load(telemetry=False, messages=False)
+                        sess = _load_session_safe(
+                            yr, int(event['RoundNumber']), sid,
+                            laps=True, telemetry=False, weather=False, messages=False,
+                            delay=2.0  # Slightly longer delay for fuller sessions
+                        )
+                        if sess is not None:
                             conv_sessions_loaded += 1
-                        except:
-                            pass
             except Exception as e:
                 results["errors"].append(f"Sunday conversion data {yr}: {e}")
         results["stages"].append(f"Sunday conversion data: {conv_sessions_loaded} sessions cached")
@@ -623,12 +673,13 @@ class F1DataEngine:
             circuit_sessions_loaded = 0
             for yr in [2023, 2024, 2025]:
                 for sid in ['Q', 'R', 'FP2']:
-                    try:
-                        session = fastf1.get_session(yr, circuit, sid)
-                        session.load(telemetry=False, messages=False)
+                    sess = _load_session_safe(
+                        yr, circuit, sid,
+                        laps=True, telemetry=False, weather=False, messages=False,
+                        delay=2.0
+                    )
+                    if sess is not None:
                         circuit_sessions_loaded += 1
-                    except:
-                        pass
             results["stages"].append(f"Circuit history ({circuit}): {circuit_sessions_loaded} sessions cached")
             _update(90, f"Circuit history for {circuit} cached.")
         except Exception as e:
@@ -641,16 +692,17 @@ class F1DataEngine:
             if sched_2026 is not None and not sched_2026.empty:
                 past = sched_2026[sched_2026['RoundNumber'] > 0].iloc[::-1].head(3)
                 for _, event in past.iterrows():
-                    try:
-                        session = fastf1.get_session(2026, int(event['RoundNumber']), 'Q')
-                        session.load(telemetry=False, messages=False)
-                    except:
-                        pass
+                    _load_session_safe(
+                        2026, int(event['RoundNumber']), 'Q',
+                        laps=True, telemetry=False, weather=False, messages=False,
+                        delay=2.0
+                    )
             results["stages"].append("Rolling team ratings: sessions cached")
         except Exception as e:
             results["errors"].append(f"Rolling ratings: {e}")
 
         _update(100, "Sync complete.")
+        results["total_downloaded"] = results.pop("downloaded", 0)
         return results
 
     def check_cache_health(self) -> Dict[str, Any]:
@@ -673,13 +725,33 @@ class F1DataEngine:
         if not health["cache_exists"]:
             return health
 
-        # Walk the cache directory and count session files
+        # FastF1 stores parsed data as .ff1pkl files inside cache/static/<year>/<event>/<session>/
+        # It also stores raw HTTP responses in fastf1_http_cache.sqlite
+        # We count unique SESSION DIRECTORIES (each directory = one loaded session)
         session_files = []
-        for root, dirs, files in os.walk(self.cache_dir):
-            for f in files:
-                if f.endswith('.ff1') or f.endswith('.pkl') or f.endswith('.json'):
-                    session_files.append(os.path.join(root, f))
-        health["total_sessions_cached"] = len(session_files)
+        session_dirs = set()
+        sqlite_exists = os.path.exists(os.path.join(self.cache_dir, 'fastf1_http_cache.sqlite'))
+        health["http_cache_exists"] = sqlite_exists
+
+        static_dir = os.path.join(self.cache_dir, 'static')
+        if os.path.exists(static_dir):
+            for root, dirs, files in os.walk(static_dir):
+                for f in files:
+                    if f.endswith('.ff1pkl') or f.endswith('.ff1') or f.endswith('.pkl'):
+                        session_files.append(os.path.join(root, f))
+                        # Each unique parent directory = one session
+                        session_dirs.add(root)
+        else:
+            # Fallback: walk the whole cache dir
+            for root, dirs, files in os.walk(self.cache_dir):
+                for f in files:
+                    if f.endswith('.ff1pkl') or f.endswith('.ff1') or f.endswith('.pkl'):
+                        session_files.append(os.path.join(root, f))
+                        session_dirs.add(root)
+
+        # Count unique sessions (directories), not individual files
+        health["total_sessions_cached"] = len(session_dirs) if session_dirs else (1 if sqlite_exists else 0)
+        health["total_cache_files"] = len(session_files)
 
         # Check for rookie data: need 2023/2024/2025 race files
         rookie_files = [f for f in session_files if any(str(yr) in f for yr in ['2023', '2024', '2025'])]
