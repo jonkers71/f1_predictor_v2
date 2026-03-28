@@ -779,21 +779,51 @@ async def get_current_prediction(session_type: str = "Q"):
         
         X = model.prepare_features(session_context)
         scores, predicted_deltas, breakdowns = model.predict(X, session_type=session_type)
-        
-        sorted_score_indices = np.argsort(scores)
+
+        # --- Baseline lap time: use the actual fastest ideal lap from the session,
+        #     falling back to a circuit-appropriate default only if no data exists.
+        #     This ensures displayed times are grounded in real session data.
+        actual_baseline = min(
+            (t for t in final_mapped_laps.values() if t and t > 60),
+            default=None
+        )
+        if actual_baseline is None:
+            # Hard fallback: use 89.0s only if we have absolutely no session data
+            actual_baseline = 89.0
+            logger.warning("No ideal lap times found — using 89.0s hardcoded baseline")
+        else:
+            logger.info(f"Using actual session baseline: {engine.format_lap_time(actual_baseline)}")
+
+        # Build predictions with times anchored to the real baseline
         predictions = []
         for i in range(len(current_grid)):
-            pred_rank = int(np.where(sorted_score_indices == i)[0][0] + 1)
+            predicted_time_sec = actual_baseline + predicted_deltas[i]
             predictions.append({
-                "rank": pred_rank,
+                "_score": float(scores[i]),          # composite score (lower = better)
+                "_time_sec": predicted_time_sec,      # raw seconds for sorting
                 "driver": current_grid[i]["FullName"],
                 "team": current_grid[i]["TeamName"],
-                "time": engine.format_lap_time(89.0 + predicted_deltas[i]),
+                "time": engine.format_lap_time(predicted_time_sec),
                 "breakdown": breakdowns[i],
                 "confidence": breakdowns[i].get("confidence_score", 100)
             })
-            
-        predictions.sort(key=lambda x: x['rank'])
+
+        # --- Ranking strategy:
+        #   QUALIFYING: rank purely by predicted lap time (fastest = P1).
+        #     The composite score already fed into predicted_deltas via base_pace_delta,
+        #     so the time IS the ranking signal. Sorting by time keeps them consistent.
+        #   RACE: rank by composite score (includes tyre deg, Sunday conversion etc.)
+        #     because race pace is not just about raw lap time.
+        if session_type == 'Q':
+            predictions.sort(key=lambda x: x['_time_sec'])
+        else:
+            predictions.sort(key=lambda x: x['_score'])
+
+        # Assign final rank positions and clean up internal keys
+        for pos, pred in enumerate(predictions, start=1):
+            pred["rank"] = pos
+            pred.pop("_score", None)
+            pred.pop("_time_sec", None)
         
         return {
             "event": active['name'],
